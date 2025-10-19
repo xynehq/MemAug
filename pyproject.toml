@@ -33,7 +33,8 @@ build-commit-diff = "mem_aug.utils.build_commit_diff:cli"
 check-ast-coverage = "mem_aug.utils.check_ast_coverage:cli"
 test-llm = "mem_aug.utils.test_llm:cli"
 cleanup-dataset = "mem_aug.utils.cleanup_dataset:cli"
-
+build-commit-diff = "mem_aug.utils.build_commit_diff:cli"
+check-ast-coverage = "mem_aug.utils.check_ast_coverage:cli"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mem_aug"]
 

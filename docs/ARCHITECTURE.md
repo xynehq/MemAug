@@ -107,26 +107,49 @@ output = hidden_states + context
 
 ### 4. Hybrid Attention Layer
 
-**Integration**: Combines all three attention mechanisms
+**Integration**: Combines all three attention mechanisms using **softmax-based gating**
 
 ```python
 def hybrid_attention(hidden_states, internal_memory, external_memory):
-    # 1. Standard self-attention
+    # 1. Standard self-attention (A_t)
     attn_out = self_attention(hidden_states)
     
-    # 2. Add internal memory (if enabled)
+    # 2. Internal memory output (M_int)
+    mem_out = None
     if use_internal_memory:
         mem_out, new_memory = internal_memory(attn_out, memory_state)
-        attn_out = attn_out + mem_out
     
-    # 3. Add external memory (if enabled)
+    # 3. External memory output (M_ext)
+    ext_out = None
     if use_external_memory and external_memory.is_ready():
-        retrieved = external_memory.retrieve(attn_out)
-        ext_out = fuse_external(attn_out, retrieved)
-        attn_out = attn_out + ext_out
+        retrieved = external_memory.retrieve(hidden_states)
+        ext_out = fuse_external(hidden_states, retrieved)
     
-    return attn_out, new_memory
+    # 4. Softmax gating to combine outputs
+    # Compute gate weights: g = softmax(W_g @ h_t + b_g)
+    gate_logits = gate_network(hidden_states)  # [batch, seq_len, 3]
+    gate_weights = softmax(gate_logits[:, :, :active_sources], dim=-1)
+    
+    # 5. Weighted combination: H_t = Σ g[i] * M[i]
+    memory_outputs = [attn_out]
+    if mem_out is not None:
+        memory_outputs.append(mem_out)
+    if ext_out is not None:
+        memory_outputs.append(ext_out)
+    
+    combined = sum(gate_weights[:, :, i:i+1] * memory_outputs[i] 
+                   for i in range(len(memory_outputs)))
+    
+    return combined, new_memory
 ```
+
+**Key Equation**:
+```
+H_t = g[0] * A_t + g[1] * M_int + g[2] * M_ext
+where g = softmax(W_g @ h_t + b_g)
+```
+
+This ensures gate weights sum to 1.0 and the model learns to dynamically balance between memory sources.
 
 ---
 

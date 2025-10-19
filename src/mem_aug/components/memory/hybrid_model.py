@@ -16,6 +16,8 @@ from transformers.configuration_utils import PretrainedConfig
 from .internal_memory import InternalMemoryModule
 from .external_memory import ExternalMemoryBank
 
+# LoRA support removed - models should be prepared externally
+
 
 class HybridTransformerConfig(PretrainedConfig):
     """Extended config with hybrid memory parameters for any transformer model."""
@@ -40,11 +42,21 @@ class HybridTransformerConfig(PretrainedConfig):
         self.retrieval_k = kwargs.pop("retrieval_k", 8)
         self.chunk_size = kwargs.pop("chunk_size", 4)
         self.use_gpu_to_search = kwargs.pop("use_gpu_to_search", True)
-        self.batch_size = kwargs.pop("batch_size", 1)
+        
+        # Learnable retrieval gate
+        self.use_gated_retrieval = kwargs.pop("use_gated_retrieval", False)
+        
+        # Embedding layer path for fast text encoding (user-configurable)
+        self.embedding_layer_path = kwargs.pop("embedding_layer_path", None)
+        # Remove fixed batch size constraint for better parallelization
+        self.max_batch_size = kwargs.pop("max_batch_size", 32)
+        self.batch_size = kwargs.pop("batch_size", None)  # Allow dynamic
         self.log_freq = kwargs.pop("log_freq", 100)
         
         # Retrieval layer configuration
         self.num_retrieval_layers = kwargs.pop("num_retrieval_layers", None)
+        
+        # LoRA parameters removed - models should be prepared externally
         
         # Call parent init with remaining kwargs
         super().__init__(**kwargs)
@@ -118,6 +130,18 @@ class HybridMemoryAttention(nn.Module):
             self.active_sources += 1
         if config.use_external_memory:
             self.active_sources += 1
+        
+        # Learnable retrieval gate (if enabled)
+        use_gated_retrieval = getattr(config, 'use_gated_retrieval', False)
+        if use_gated_retrieval and config.use_external_memory:
+            self.g_retrieve = nn.Parameter(torch.tensor(0.5))
+            self.use_gated_retrieval = True
+            # Cache for previously retrieved context (reused when gate < threshold)
+            self.cached_ext_context = None
+        else:
+            self.g_retrieve = None
+            self.use_gated_retrieval = False
+            self.cached_ext_context = None
     
     def forward(
         self,
@@ -147,16 +171,21 @@ class HybridMemoryAttention(nn.Module):
             updated_internal_memory: Updated internal memory state
         """
         # Standard self-attention (A_t)
-        attn_result = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            output_attentions=False,
-            use_cache=False,
-            cache_position=None,
-            position_embeddings=position_embeddings,
-        )
+        # Handle different model architectures
+        try:
+            # Try Llama-style (requires position_embeddings and attention_mask)
+            if position_embeddings is not None:
+                attn_result = self.self_attn(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask
+                )
+            else:
+                # Try GPT2-style (just hidden_states and optional attention_mask)
+                attn_result = self.self_attn(hidden_states, attention_mask=attention_mask)
+        except TypeError:
+            # Fallback: just hidden_states
+            attn_result = self.self_attn(hidden_states)
         # Handle both return formats
         if isinstance(attn_result, tuple):
             attn_output = attn_result[0]
@@ -176,14 +205,52 @@ class HybridMemoryAttention(nn.Module):
             )
             memory_outputs.append(internal_mem_output)
         
-        # External memory (M_ext)
+        # External memory (M_ext) with gating and context caching
+        ext_out = None
         if self.use_external_memory and external_kv is not None:
-            external_mem_output = self._compute_external_memory(
-                attn_output,
-                external_kv,
-                attention_mask
-            )
-            memory_outputs.append(external_mem_output)
+            if self.use_gated_retrieval and self.g_retrieve is not None:
+                # Compute gate value
+                gate = torch.sigmoid(self.g_retrieve)
+                
+                # Check against threshold
+                if self.training:
+                    # During training: always retrieve but weight the output
+                    ext_context = self._compute_external_memory(
+                        attn_output,
+                        external_kv,
+                        attention_mask
+                    )
+                    ext_out = gate * ext_context
+                    # Cache the retrieved context for potential reuse
+                    self.cached_ext_context = ext_context.detach()
+                else:
+                    # During inference: adaptive retrieval with caching
+                    threshold = getattr(self.config, 'retrieval_threshold', 0.5)
+                    if gate.item() > threshold:
+                        # Gate above threshold: retrieve fresh context
+                        ext_out = self._compute_external_memory(
+                            attn_output,
+                            external_kv,
+                            attention_mask
+                        )
+                        # Update cache with fresh retrieval
+                        self.cached_ext_context = ext_out.detach()
+                    else:
+                        # Gate below threshold: reuse cached context if available
+                        if self.cached_ext_context is not None:
+                            # Reuse previous retrieval (model learns when context is still valid)
+                            ext_out = self.cached_ext_context
+                        # else: ext_out remains None (no cache available yet)
+            else:
+                # Standard retrieval without gating
+                ext_out = self._compute_external_memory(
+                    attn_output,
+                    external_kv,
+                    attention_mask
+                )
+            
+            if ext_out is not None:
+                memory_outputs.append(ext_out)
         
         # Compute gating weights using softmax
         # g = softmax(W_g @ h_t + b_g)  shape: [batch, seq_len, num_sources]
@@ -202,6 +269,15 @@ class HybridMemoryAttention(nn.Module):
             combined_output = combined_output + gate_weights[:, :, i:i+1] * mem_output
         
         return combined_output, updated_internal_memory
+    
+    def log_gate_value(self, step: int) -> Optional[float]:
+        """Log retrieval gate value for debugging."""
+        if self.use_gated_retrieval and self.g_retrieve is not None:
+            gate_value = torch.sigmoid(self.g_retrieve).item()
+            if step % 1000 == 0:
+                print(f"Layer {self.layer_idx} - Step {step}: Retrieval gate = {gate_value:.4f}")
+            return gate_value
+        return None
     
     def _compute_external_memory(
         self,
@@ -320,66 +396,182 @@ class HybridTransformerModel(PreTrainedModel):
     """
     
     config_class = HybridTransformerConfig
+    supports_gradient_checkpointing = True
     
-    def __init__(self, config: HybridTransformerConfig, tokenizer: AutoTokenizer):
+    def __init__(self, config: HybridTransformerConfig, tokenizer: AutoTokenizer, base_model=None):
         super().__init__(config)
         self.config = config
         self.tokenizer = tokenizer
         
-        # Create base config without memory parameters
-        base_config = AutoConfig.for_model(
-            model_type=config.model_type if hasattr(config, 'model_type') and config.model_type != 'hybrid_transformer' else 'llama',
-            vocab_size=config.vocab_size,
-            hidden_size=config.hidden_size,
-            num_hidden_layers=config.num_hidden_layers,
-            num_attention_heads=config.num_attention_heads,
-            intermediate_size=config.intermediate_size,
-            max_position_embeddings=config.max_position_embeddings,
-            rms_norm_eps=getattr(config, 'rms_norm_eps', 1e-6),
-            rope_theta=getattr(config, 'rope_theta', 10000.0),
-            attention_dropout=getattr(config, 'attention_dropout', 0.0),
-        )
+        if base_model is not None:
+            # Use provided model (could be LoRA-enhanced or any other model)
+            self.full_model = base_model  # Keep reference to full model for forward pass
+            
+            # Extract transformer and lm_head components based on architecture
+            # Handle PEFT wrapped models
+            if hasattr(base_model, 'base_model') and hasattr(base_model.base_model, 'model'):
+                # PEFT wrapped model: PeftModel -> LoraModel -> GPT2LMHeadModel -> GPT2Model
+                peft_base = base_model.base_model.model  # This is GPT2LMHeadModel
+                if hasattr(peft_base, 'transformer'):
+                    self.model = peft_base.transformer  # GPT2Model
+                    self.lm_head = peft_base.lm_head
+                elif hasattr(peft_base, 'model'):
+                    self.model = peft_base.model
+                    self.lm_head = peft_base.lm_head
+                else:
+                    self.model = peft_base
+                    self.lm_head = None
+            elif hasattr(base_model, 'model'):
+                # For models like GPT2LMHeadModel -> GPT2Model
+                self.model = base_model.model
+                self.lm_head = base_model.lm_head
+            elif hasattr(base_model, 'transformer'):
+                # For some older models
+                self.model = base_model.transformer
+                self.lm_head = getattr(base_model, 'lm_head', None)
+            else:
+                # Direct transformer model
+                self.model = base_model
+                self.lm_head = None
+                self.full_model = base_model
+        else:
+            # Create base config without memory parameters
+            base_config = AutoConfig.for_model(
+                model_type=config.model_type if hasattr(config, 'model_type') and config.model_type != 'hybrid_transformer' else 'llama',
+                vocab_size=config.vocab_size,
+                hidden_size=config.hidden_size,
+                num_hidden_layers=config.num_hidden_layers,
+                num_attention_heads=config.num_attention_heads,
+                intermediate_size=config.intermediate_size,
+                max_position_embeddings=config.max_position_embeddings,
+                rms_norm_eps=getattr(config, 'rms_norm_eps', 1e-6),
+                rope_theta=getattr(config, 'rope_theta', 10000.0),
+                attention_dropout=getattr(config, 'attention_dropout', 0.0),
+            )
+            
+            # Load base model from config
+            base_model = AutoModelForCausalLM.from_config(base_config)
+            self.full_model = base_model
+            self.model = base_model.model  # Get the base transformer
+            self.lm_head = base_model.lm_head
         
-        # Load base model from config
-        base_model = AutoModelForCausalLM.from_config(base_config)
-        self.model = base_model.model  # Get the base transformer
-        self.lm_head = base_model.lm_head
-        
-        # Initialize internal memory
+        # Initialize internal memory with dynamic batch support
         if config.use_internal_memory:
-            self.internal_memory = torch.stack([
-                torch.eye(config.memory_slots, requires_grad=False)
-                for _ in range(config.batch_size)
-            ])
-            self.register_buffer("internal_memory_bank", self.internal_memory)
+            # Create template memory that can be expanded dynamically
+            self.memory_template = torch.eye(config.memory_slots, requires_grad=False)
+            self.register_buffer("memory_template_buffer", self.memory_template)
+            self.internal_memory = None  # Will be created dynamically
         else:
             self.internal_memory = None
         
         # Initialize external memory bank
         if config.use_external_memory:
-            self.external_memory = ExternalMemoryBank(config)
+            self.external_memory = ExternalMemoryBank(
+                config, 
+                model=self, 
+                tokenizer=tokenizer,
+                embedding_layer_path=config.embedding_layer_path
+            )
         else:
             self.external_memory = None
         
         # Wrap decoder layers with hybrid memory (if they exist)
-        if hasattr(self.model, 'layers'):
+        if hasattr(self.model, 'layers') or hasattr(self.model, 'h'):
             self._wrap_decoder_layers()
+        
+        # Initialize gradient checkpointing state
+        self.gradient_checkpointing = False
+    
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get information about the model."""
+        # Count trainable parameters across the entire model
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        
+        # Check for PEFT in the original full model
+        has_peft = False
+        peft_info = {}
+        
+        if hasattr(self, 'full_model'):
+            # Check if full_model is a PEFT model
+            if hasattr(self.full_model, 'peft_config') and self.full_model.peft_config:
+                has_peft = True
+                peft_info["peft_type"] = "PEFT_MODEL"
+                peft_info["active_adapters"] = list(self.full_model.peft_config.keys())
+            elif hasattr(self.full_model, 'base_model') and hasattr(self.full_model.base_model, 'peft_config'):
+                has_peft = True
+                peft_info["peft_type"] = "PEFT_MODEL"
+                peft_info["active_adapters"] = list(self.full_model.base_model.peft_config.keys())
+        
+        info = {
+            "trainable_params": trainable_params,
+            "total_params": total_params,
+            "trainable_percentage": 100 * trainable_params / total_params if total_params > 0 else 0,
+            "has_peft": has_peft,
+        }
+        
+        info.update(peft_info)
+        return info
+    
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for the model."""
+        self.gradient_checkpointing = True
+        
+        # Enable on base model as well
+        if hasattr(self, 'full_model') and hasattr(self.full_model, 'gradient_checkpointing_enable'):
+            try:
+                self.full_model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the model."""
+        self.gradient_checkpointing = False
+        
+        # Disable on base model as well
+        if hasattr(self, 'full_model') and hasattr(self.full_model, 'gradient_checkpointing_disable'):
+            try:
+                self.full_model.gradient_checkpointing_disable()
+            except Exception:
+                pass
     
     def _wrap_decoder_layers(self):
         """Wrap existing decoder layers with hybrid memory attention."""
-        original_layers = self.model.layers
+        # Get layers based on architecture
+        if hasattr(self.model, 'layers'):
+            original_layers = self.model.layers
+            layer_attr = 'layers'
+        elif hasattr(self.model, 'h'):  # GPT-style
+            original_layers = self.model.h
+            layer_attr = 'h'
+        else:
+            raise ValueError(f"Cannot find layers in model: {type(self.model)}")
         
         class HybridDecoderLayer(nn.Module):
             def __init__(self, original_layer, config, layer_idx):
                 super().__init__()
                 self.original_layer = original_layer
+                
+                # Handle different layer architectures
+                if hasattr(original_layer, 'self_attn'):
+                    # Llama/standard architecture
+                    attn_layer = original_layer.self_attn
+                    self.input_layernorm = original_layer.input_layernorm
+                    self.post_attention_layernorm = original_layer.post_attention_layernorm
+                elif hasattr(original_layer, 'attn'):
+                    # GPT2 architecture
+                    attn_layer = original_layer.attn
+                    self.input_layernorm = original_layer.ln_1
+                    self.post_attention_layernorm = original_layer.ln_2
+                else:
+                    raise ValueError(f"Cannot find attention layer in {type(original_layer)}")
+                
                 self.hybrid_attn = HybridMemoryAttention(
                     config,
-                    original_layer.self_attn,
+                    attn_layer,
                     layer_idx
                 )
-                self.input_layernorm = original_layer.input_layernorm
-                self.post_attention_layernorm = original_layer.post_attention_layernorm
                 self.mlp = original_layer.mlp
             
             def forward(
@@ -390,6 +582,7 @@ class HybridTransformerModel(PreTrainedModel):
                 internal_memory=None,
                 external_kv=None,
                 position_embeddings=None,
+                **kwargs  # Accept additional arguments from generate
             ):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
@@ -415,10 +608,10 @@ class HybridTransformerModel(PreTrainedModel):
                 return hidden_states, updated_internal_memory
         
         # Replace layers
-        self.model.layers = nn.ModuleList([
+        setattr(self.model, layer_attr, nn.ModuleList([
             HybridDecoderLayer(layer, self.config, idx)
             for idx, layer in enumerate(original_layers)
-        ])
+        ]))
     
     def forward(
         self,
@@ -427,7 +620,9 @@ class HybridTransformerModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         use_external_memory: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+        output_hidden_states: bool = False,
+        **kwargs
+    ):
         """
         Forward pass with hybrid memory.
         
@@ -437,17 +632,22 @@ class HybridTransformerModel(PreTrainedModel):
             attention_mask: Attention mask
             position_ids: Position IDs
             use_external_memory: Whether to use external memory retrieval
+            output_hidden_states: Whether to return hidden states
         
         Returns:
-            logits: Output logits
-            loss: Cross-entropy loss (if targets provided)
-            memory_info: Dictionary with memory states
+            Output object with logits, loss, memory_info, and optionally hidden_states
         """
         device = input_ids.device
         batch_size, seq_len = input_ids.size()
         
-        # Ensure internal memory is on correct device
-        if self.internal_memory is not None:
+        # Create internal memory dynamically based on actual batch size
+        if hasattr(self, 'memory_template'):
+            # Create memory for current batch size
+            internal_memory = self.memory_template.unsqueeze(0).expand(
+                batch_size, -1, -1
+            ).contiguous().to(device)
+        elif self.internal_memory is not None:
+            # Fallback to old method
             if self.internal_memory.device != device:
                 self.internal_memory = self.internal_memory.to(device)
             internal_memory = self.internal_memory.detach()
@@ -460,8 +660,40 @@ class HybridTransformerModel(PreTrainedModel):
                 seq_len, device=device
             ).unsqueeze(0).repeat(batch_size, 1)
         
-        # Get embeddings
-        inputs_embeds = self.model.embed_tokens(input_ids)
+        # Get embeddings - handle different model architectures
+        # The model here is the transformer part (e.g., GPT2Model), not the LMHead wrapper
+        if hasattr(self.model, 'embed_tokens'):
+            inputs_embeds = self.model.embed_tokens(input_ids)
+        elif hasattr(self.model, 'wte'):  # GPT-style models
+            inputs_embeds = self.model.wte(input_ids)
+        elif hasattr(self.model, 'embeddings'):  # BERT-style models
+            inputs_embeds = self.model.embeddings.word_embeddings(input_ids)
+        else:
+            # Try to find embedding layer recursively
+            embedding_layer = None
+            for name, module in self.model.named_modules():
+                if ('embed' in name.lower() or 'wte' in name.lower()) and hasattr(module, 'weight'):
+                    try:
+                        # Test if this is an embedding layer by checking forward
+                        test_output = module(input_ids[:1, :1])  # Test with small input
+                        if len(test_output.shape) == 3:  # [batch, seq, hidden]
+                            embedding_layer = module
+                            break
+                    except:
+                        continue
+            
+            if embedding_layer is not None:
+                inputs_embeds = embedding_layer(input_ids)
+            else:
+                # Ultimate fallback: use the lm_head weight transposed as embedding
+                if self.lm_head is not None and hasattr(self.lm_head, 'weight'):
+                    # Create embedding layer from lm_head
+                    vocab_size, hidden_size = self.lm_head.weight.shape
+                    embedding_weight = self.lm_head.weight.t()  # Transpose to [hidden, vocab]
+                    inputs_embeds = torch.nn.functional.embedding(input_ids, embedding_weight.t())
+                else:
+                    raise ValueError(f"Cannot find embedding layer in model architecture: {type(self.model)}")
+        
         hidden_states = inputs_embeds
         
         # Create causal attention mask
@@ -473,14 +705,30 @@ class HybridTransformerModel(PreTrainedModel):
             attention_mask, (batch_size, seq_len), inputs_embeds, 0
         )
         
-        # Get position embeddings
-        position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
+        # Get position embeddings - handle different model architectures
+        if hasattr(self.model, 'rotary_emb'):
+            position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
+        else:
+            # For models without rotary embeddings, skip position embeddings
+            position_embeddings = None
         
         # Get retrieval layers
         retrieval_layers = set(self.config.get_retrieval_layers())
         
-        # Process through decoder layers
-        for layer_idx, decoder_layer in enumerate(self.model.layers):
+        # Collect hidden states if requested
+        all_hidden_states = []
+        if output_hidden_states:
+            all_hidden_states.append(hidden_states)
+        
+        # Process through decoder layers - handle different architectures
+        if hasattr(self.model, 'layers'):
+            layers = self.model.layers
+        elif hasattr(self.model, 'h'):  # GPT-style models
+            layers = self.model.h
+        else:
+            raise ValueError(f"Cannot find transformer layers in model: {type(self.model)}")
+        
+        for layer_idx, decoder_layer in enumerate(layers):
             # Retrieve from external memory only at specified layers
             external_kv = None
             if (use_external_memory and 
@@ -492,28 +740,68 @@ class HybridTransformerModel(PreTrainedModel):
                 queries = hidden_states.transpose(0, 1)  # [seq_len, batch, hidden]
                 external_kv = self.external_memory.retrieve(queries)
             
-            # Forward through layer
-            hidden_states, internal_memory = decoder_layer(
-                hidden_states=hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                internal_memory=internal_memory,
-                external_kv=external_kv,
-                position_embeddings=position_embeddings,
-            )
+            # Forward through layer with optional gradient checkpointing
+            if self.gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+                
+                hidden_states, internal_memory = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(decoder_layer),
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    internal_memory,
+                    external_kv,
+                    position_embeddings,
+                    use_reentrant=False
+                )
+            else:
+                hidden_states, internal_memory = decoder_layer(
+                    hidden_states=hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    internal_memory=internal_memory,
+                    external_kv=external_kv,
+                    position_embeddings=position_embeddings,
+                )
+            
+            # Collect hidden states if requested
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
         
-        # Final layer norm and output projection
-        hidden_states = self.model.norm(hidden_states)
-        logits = self.lm_head(hidden_states).float()
+        # Final layer norm and output projection - handle different architectures
+        if hasattr(self.model, 'norm'):
+            hidden_states = self.model.norm(hidden_states)
+        elif hasattr(self.model, 'ln_f'):  # GPT2 uses ln_f
+            hidden_states = self.model.ln_f(hidden_states)
+        # Some models don't have final norm
+        
+        if self.lm_head is not None:
+            logits = self.lm_head(hidden_states).float()
+        else:
+            # If no lm_head, assume hidden_states are logits
+            logits = hidden_states.float()
         
         # Calculate loss if targets provided
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=self.tokenizer.pad_token_id,
-            )
+            # Use standard ignore_index for cross entropy
+            flat_logits = logits.view(-1, logits.size(-1))
+            flat_targets = targets.view(-1)
+            
+            # Check if we have valid targets (not all -100)
+            valid_targets = flat_targets != -100
+            if valid_targets.sum() > 0:
+                loss = F.cross_entropy(
+                    flat_logits,
+                    flat_targets,
+                    ignore_index=-100,
+                )
+            else:
+                # If no valid targets, create a dummy loss
+                loss = torch.tensor(0.0, requires_grad=True, device=logits.device)
         
         # Update internal memory
         if self.internal_memory is not None:
@@ -529,7 +817,20 @@ class HybridTransformerModel(PreTrainedModel):
             ),
         }
         
-        return logits, loss, memory_info
+        # Create output object similar to HuggingFace models
+        class ModelOutput:
+            def __init__(self, logits, loss=None, memory_info=None, hidden_states=None):
+                self.logits = logits
+                self.loss = loss
+                self.memory_info = memory_info
+                self.hidden_states = hidden_states
+                self.last_hidden_state = hidden_states[-1] if hidden_states else None
+        
+        # Return based on requested outputs
+        if output_hidden_states:
+            return ModelOutput(logits, loss, memory_info, tuple(all_hidden_states))
+        else:
+            return logits, loss, memory_info
     
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
@@ -586,6 +887,18 @@ class HybridTransformerModel(PreTrainedModel):
         return inverted_mask.masked_fill(
             inverted_mask.to(torch.bool), torch.finfo(dtype).min
         )
+    
+    def generate(self, *args, **kwargs):
+        """
+        Generate text using the underlying model's generate method.
+        Delegates to the full_model (which may be PEFT-enhanced).
+        """
+        if hasattr(self, 'full_model') and hasattr(self.full_model, 'generate'):
+            return self.full_model.generate(*args, **kwargs)
+        else:
+            raise NotImplementedError(
+                "Generate method not available. The underlying model doesn't support generation."
+            )
     
     def configure_optimizers(self, train_config):
         """Configure optimizer with proper parameter groups."""
