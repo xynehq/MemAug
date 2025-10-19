@@ -27,6 +27,25 @@ This hybrid module integrates:
 
 ## Installation
 
+### Option 1: Using UV (Recommended)
+
+```bash
+# Install UV if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the repository
+git clone <repository-url>
+cd CodeRL
+
+# Install core dependencies
+uv sync
+
+# Install optional dependencies for data generation (OpenAI integration)
+uv sync --extra tasks
+```
+
+### Option 2: Using Conda
+
 ```bash
 # Create conda environment
 conda env create -n hybrid_llm -f environment.yaml
@@ -38,14 +57,113 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### 1. Prepare Your Data
+### 1. Data Generation Pipeline
+
+This project includes a comprehensive AST-based code diff extraction and reasoning generation pipeline for creating training data from Git repositories.
+
+#### Step 1: Configure LLM (for task and reasoning generation)
 
 ```bash
-# Prepare input/output training data
-python data_proc/prepare_io_data.py \
-  --input_file data/train_inputs.jsonl \
-  --output_file data/train_outputs.jsonl \
-  --save_dir datasets/io_pairs
+# Copy the example environment file
+cp .env.example .env
+
+# Edit .env and add your API configuration
+# OPENAI_API_KEY=your_api_key_here
+# LLM_BASE_URL=https://api.openai.com/v1  (optional)
+# LLM_MODEL_NAME=gpt-3.5-turbo  (optional)
+
+# Test your LLM connection
+uv run test-llm
+```
+
+#### Step 2: Manage Repositories
+
+Repositories are configured in `config/config.yaml`. Edit the file to add or remove repositories:
+
+```yaml
+repositories:
+  - name: bat
+    url: "https://github.com/sharkdp/bat.git"
+  - name: ripgrep
+    url: "https://github.com/BurntSushi/ripgrep.git"
+```
+
+Then sync the repositories:
+
+```bash
+# Download all configured repositories
+uv run manage-repos sync
+
+# Check repository status
+uv run manage-repos status
+
+# List downloaded repositories
+uv run manage-repos list
+```
+
+#### Step 3: Run the Data Generation Pipeline
+
+The pipeline consists of 5 stages that should be run in sequence:
+
+```bash
+# Stage 1: Extract AST from commits
+uv run generate-ast
+
+# Stage 2: Generate AST diffs between commits
+uv run generate-ast-diffs
+
+# Stage 3: Generate task descriptions from diffs (requires LLM)
+uv run generate-tasks
+
+# Stage 4: Generate reasoning for code changes (requires LLM)
+uv run generate-reasoning
+
+# Stage 5: Build FIM (Fill-in-the-Middle) training dataset
+uv run generate-fim
+```
+
+**Process specific repositories:**
+```bash
+uv run generate-ast bat ripgrep
+uv run generate-tasks bat
+uv run generate-reasoning bat
+```
+
+#### Step 4: Clean Up Generated Files (Optional)
+
+If you need to regenerate specific files (e.g., after updating prompts):
+
+```bash
+# Dry run to see what would be removed
+uv run cleanup-dataset --tasks --reasoning --dry-run
+
+# Remove task.json files to regenerate tasks
+uv run cleanup-dataset --tasks
+
+# Remove reasoning.json files to regenerate reasoning
+uv run cleanup-dataset --reasoning
+
+# Remove specific files from specific repositories
+uv run cleanup-dataset --tasks --reasoning bat ripgrep
+```
+
+#### Output Structure
+
+The pipeline generates the following structure:
+```
+data/ast_dataset/
+├── bat/
+│   ├── commit_0/
+│   │   ├── ast.jsonl              # AST nodes for this commit
+│   │   ├── commit_data.json       # Commit metadata and diff
+│   │   ├── diff_ast.jsonl         # Function-level changes
+│   │   ├── task.json              # LLM-generated tasks
+│   │   ├── reasoning.json         # LLM-generated reasoning
+│   │   └── fim_dataset.json       # FIM training samples
+│   ├── commit_1/
+│   └── ...
+└── ripgrep/
+    └── ...
 ```
 
 ### 2. Train the Model
@@ -117,29 +235,127 @@ train:
   dtype: bfloat16
 ```
 
+## Data Generation Pipeline Details
+
+The pipeline extracts function-level code changes from Git repositories and generates training data with tasks and reasoning.
+
+### Pipeline Stages
+
+1. **`generate-ast`**: Extract AST nodes from each commit
+   - Uses tree-sitter to parse source files
+   - Extracts functions, classes, methods, and other declarations
+   - Outputs: `ast.jsonl`, `commit_data.json`
+
+2. **`generate-ast-diffs`**: Compare AST between commits
+   - Identifies added, modified, and deleted functions
+   - Tracks function-level changes with before/after code
+   - Outputs: `diff_ast.jsonl`
+
+3. **`generate-tasks`**: Generate task descriptions using LLM
+   - Analyzes commit diffs to create developer tasks
+   - Chunks large diffs for better LLM processing
+   - Outputs: `task.json`
+   - Requires: OpenAI API key in `.env`
+
+4. **`generate-reasoning`**: Generate step-by-step reasoning using LLM
+   - Creates first-person developer perspective reasoning
+   - Tailored prompts for ADD/UPDATE/DELETE operations
+   - Filters tasks relevant to each function
+   - Outputs: `reasoning.json`
+   - Requires: OpenAI API key in `.env`
+
+5. **`generate-fim`**: Build Fill-in-the-Middle training dataset
+   - Extracts code context (prefix/suffix)
+   - Identifies exact changed lines
+   - Creates training samples for code completion
+   - Outputs: `fim_dataset.json`
+
+### Data Format Examples
+
+**diff_ast.jsonl** (function-level changes):
+```json
+{
+  "id": "src/main.rs::function::run",
+  "file": "src/main.rs",
+  "kind": "function_item",
+  "status": "modified",
+  "before_code": "fn run() { ... }",
+  "after_code": "fn run() { ... }",
+  "commit_metadata": {...}
+}
+```
+
+**task.json** (LLM-generated tasks):
+```json
+{
+  "commit_number": 5,
+  "commit_hash": "a7232a6e",
+  "tasks": [
+    "Implement custom syntax loading from user config directory",
+    "Add fallback to default syntax set if custom loading fails"
+  ]
+}
+```
+
+**reasoning.json** (LLM-generated reasoning):
+```json
+{
+  "function_id": "src/main.rs::function::run",
+  "operation_type": "UPDATE",
+  "reasoning": "Looking at the task, I need to add custom syntax loading. First, I'll construct the path to the .config/bat/syntax directory..."
+}
+```
+
+**fim_dataset.json** (training samples):
+```json
+{
+  "function_id": "src/main.rs::function::run",
+  "operation_type": "UPDATE",
+  "fim_prefix": "fn run() {\n    let options = Options {...};\n",
+  "fim_middle": "    let mut syntax_set = SyntaxSet::new();\n    syntax_set.load_syntaxes(syntax_dir, false);",
+  "fim_suffix": "\n    Ok(())\n}"
+}
+```
+
+### CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `uv run manage-repos sync` | Download all configured repositories |
+| `uv run manage-repos status` | Show repository download status |
+| `uv run manage-repos list` | List downloaded repositories |
+| `uv run generate-ast [repos...]` | Extract AST from commits |
+| `uv run generate-ast-diffs [repos...]` | Generate AST diffs |
+| `uv run generate-tasks [repos...]` | Generate task descriptions (LLM) |
+| `uv run generate-reasoning [repos...]` | Generate reasoning (LLM) |
+| `uv run generate-fim [repos...]` | Build FIM training dataset |
+| `uv run test-llm` | Test LLM API connection |
+| `uv run cleanup-dataset --tasks/--reasoning/--fim [repos...]` | Remove generated files |
+| `uv run check-ast-coverage` | Check AST extraction coverage |
+
 ## Project Structure
 
 ```
-hybrid_llm_trainer/
+CodeRL/
+├── src/mem_aug/
+│   ├── components/
+│   │   └── datagen/
+│   │       ├── generate_commit_ast.py    # AST extraction
+│   │       ├── generate_ast_diffs.py     # Diff generation
+│   │       ├── generate_tasks.py         # Task generation (LLM)
+│   │       ├── generate_reasoning.py     # Reasoning generation (LLM)
+│   │       └── build_fim_dataset.py      # FIM dataset builder
+│   └── utils/
+│       ├── repo_manager.py               # Repository management
+│       ├── test_llm.py                   # LLM connection tester
+│       └── cleanup_dataset.py            # Dataset cleanup utility
+├── data/
+│   ├── ast_dataset/                      # Generated datasets
+│   └── repos/                            # Cloned repositories
 ├── configs/              # Configuration files
-│   ├── train.yaml       # Main training config
-│   └── model/           # Model-specific configs
-├── data_proc/           # Data processing scripts
-│   ├── prepare_io_data.py
-│   └── data_utils.py
-├── src/
-│   ├── models/
-│   │   ├── hybrid_llama.py      # Hybrid Llama model
-│   │   ├── internal_memory.py   # LM2-style memory
-│   │   └── external_memory.py   # LongMem-style retrieval
-│   ├── dataloader.py    # Data loading utilities
-│   ├── trainer.py       # Training loop
-│   └── utils.py         # Helper functions
-├── scripts/
-│   └── train_hybrid.sh  # Training script
-├── train.py             # Main training entry point
-├── eval.py              # Evaluation script
-├── requirements.txt
+├── scripts/              # Training scripts
+├── .env.example          # LLM configuration template
+├── pyproject.toml        # Project dependencies and CLI commands
 └── README.md
 ```
 
