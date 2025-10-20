@@ -526,7 +526,7 @@ class ExternalMemoryBank:
                 # Process each query individually
                 head_indices = []
                 for q_idx in range(num_queries):
-                    single_query = query_head[q_idx:q_idx+1].cpu().numpy()  # [1, head_dim]
+                    single_query = query_head[q_idx:q_idx+1].detach().cpu().numpy()  # [1, head_dim]
                     _, single_indices = self.index_list[i].search(single_query, k_per_chunk)
                     head_indices.append(single_indices)
                 

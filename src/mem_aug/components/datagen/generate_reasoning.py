@@ -18,7 +18,7 @@ except ImportError:
     HAS_OPENAI = False
 
 # Global semaphore to limit concurrent LLM calls
-LLM_SEMAPHORE = asyncio.Semaphore(5)
+LLM_SEMAPHORE = asyncio.Semaphore(50)
 
 ADD_REASONING_PROMPT = """
 You are a developer who has been given a task. Write your step-by-step thought process as you plan to implement a new function.

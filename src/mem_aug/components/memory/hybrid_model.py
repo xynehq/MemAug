@@ -574,6 +574,19 @@ class HybridTransformerModel(PreTrainedModel):
                 )
                 self.mlp = original_layer.mlp
             
+            def __getattr__(self, name):
+                """Forward missing attributes to original layer for compatibility."""
+                # Avoid infinite recursion for special attributes
+                if name in ('original_layer', 'hybrid_attn', 'mlp', 'input_layernorm', 'post_attention_layernorm'):
+                    return super().__getattr__(name)
+                
+                # Try to get from original layer
+                try:
+                    return getattr(self.original_layer, name)
+                except AttributeError:
+                    # If not in original layer, raise the error
+                    raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            
             def forward(
                 self,
                 hidden_states,
@@ -582,6 +595,8 @@ class HybridTransformerModel(PreTrainedModel):
                 internal_memory=None,
                 external_kv=None,
                 position_embeddings=None,
+                output_attentions=False,
+                use_cache=False,
                 **kwargs  # Accept additional arguments from generate
             ):
                 residual = hidden_states
@@ -605,7 +620,25 @@ class HybridTransformerModel(PreTrainedModel):
                 hidden_states = self.mlp(hidden_states)
                 hidden_states = residual + hidden_states
                 
-                return hidden_states, updated_internal_memory
+                # Return format compatible with transformers
+                # During generation, transformers expects just hidden_states (not a tuple)
+                # Store updated_internal_memory as an attribute for later retrieval
+                self._updated_internal_memory = updated_internal_memory
+                
+                # Return in the format expected by the original layer
+                outputs = (hidden_states,)
+                
+                if output_attentions:
+                    outputs += (None,)  # We don't return attention weights
+                
+                if use_cache:
+                    outputs += (None,)  # We don't use KV cache
+                
+                # If only hidden_states requested, return just that (not a tuple)
+                if len(outputs) == 1:
+                    return outputs[0]
+                
+                return outputs
         
         # Replace layers
         setattr(self.model, layer_attr, nn.ModuleList([
@@ -747,7 +780,7 @@ class HybridTransformerModel(PreTrainedModel):
                         return module(*inputs)
                     return custom_forward
                 
-                hidden_states, internal_memory = torch.utils.checkpoint.checkpoint(
+                layer_output = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states,
                     causal_mask,
@@ -758,7 +791,7 @@ class HybridTransformerModel(PreTrainedModel):
                     use_reentrant=False
                 )
             else:
-                hidden_states, internal_memory = decoder_layer(
+                layer_output = decoder_layer(
                     hidden_states=hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -766,6 +799,17 @@ class HybridTransformerModel(PreTrainedModel):
                     external_kv=external_kv,
                     position_embeddings=position_embeddings,
                 )
+            
+            # Handle different return formats from decoder layer
+            if isinstance(layer_output, tuple):
+                # Layer returns (hidden_states, internal_memory)
+                hidden_states, internal_memory = layer_output
+            else:
+                # Layer returns just hidden_states
+                hidden_states = layer_output
+                # Try to get updated internal memory from layer attribute
+                if hasattr(decoder_layer, '_updated_internal_memory'):
+                    internal_memory = decoder_layer._updated_internal_memory
             
             # Collect hidden states if requested
             if output_hidden_states:
@@ -899,6 +943,116 @@ class HybridTransformerModel(PreTrainedModel):
             raise NotImplementedError(
                 "Generate method not available. The underlying model doesn't support generation."
             )
+    
+    def generate_with_retrieval(
+        self,
+        input_ids: torch.Tensor,
+        max_length: int = 100,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        do_sample: bool = True,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        use_external_memory: bool = True,
+    ) -> torch.Tensor:
+        """
+        Custom generation loop with external memory retrieval support.
+        
+        This method implements token-by-token generation with retrieval at each step,
+        bypassing transformers.generate() to have full control over the forward pass.
+        
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            max_length: Maximum total sequence length
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            top_p: Nucleus sampling parameter
+            do_sample: Whether to use sampling (vs greedy)
+            eos_token_id: End-of-sequence token ID
+            pad_token_id: Padding token ID
+            use_external_memory: Whether to use external memory retrieval
+        
+        Returns:
+            Generated token IDs [batch, generated_seq_len]
+        """
+        device = input_ids.device
+        batch_size = input_ids.size(0)
+        
+        # Set default token IDs
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos_token_id
+        
+        # Track which sequences are finished
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=device)
+        
+        # Generation loop
+        generated_tokens = input_ids.clone()
+        
+        for _ in range(max_length - input_ids.size(1)):
+            # Forward pass with retrieval
+            with torch.no_grad():
+                outputs = self.forward(
+                    input_ids=generated_tokens,
+                    use_external_memory=use_external_memory,
+                    output_hidden_states=False
+                )
+                
+                # Get logits for next token
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs.logits
+                
+                next_token_logits = logits[:, -1, :] / temperature
+                
+                # Apply top-k and top-p filtering
+                if do_sample:
+                    # Top-k filtering
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+                    
+                    # Top-p (nucleus) filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        
+                        # Remove tokens with cumulative probability above the threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        # Shift the indices to the right to keep the first token above threshold
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        # Scatter sorted tensors back to original indexing
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                        next_token_logits[indices_to_remove] = float('-inf')
+                    
+                    # Sample from the filtered distribution
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    # Greedy decoding
+                    next_tokens = torch.argmax(next_token_logits, dim=-1)
+                
+                # Update unfinished sequences
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                
+                # Append next tokens
+                generated_tokens = torch.cat([generated_tokens, next_tokens.unsqueeze(-1)], dim=-1)
+                
+                # Check for EOS
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.ne(eos_token_id).long()
+                )
+                
+                # Stop if all sequences are finished
+                if unfinished_sequences.max() == 0:
+                    break
+        
+        return generated_tokens
     
     def configure_optimizers(self, train_config):
         """Configure optimizer with proper parameter groups."""

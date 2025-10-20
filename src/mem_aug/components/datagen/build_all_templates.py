@@ -7,7 +7,7 @@ import json
 import argparse
 from pathlib import Path
 from typing import List
-from src.mem_aug.utils.build_training_template import build_template
+from mem_aug.utils.build_training_template import build_template
 
 
 def find_commit_directories(dataset_dir: Path) -> List[Path]:

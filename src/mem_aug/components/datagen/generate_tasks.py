@@ -20,7 +20,7 @@ except ImportError:
     print("Warning: openai and python-dotenv not installed. Install with: pip install openai python-dotenv")
 
 # Global semaphore to limit concurrent LLM calls
-LLM_SEMAPHORE = asyncio.Semaphore(5)  # Allow max 5 concurrent LLM calls
+LLM_SEMAPHORE = asyncio.Semaphore(20)  # Allow max 5 concurrent LLM calls
 
 SYSTEM_PROMPT = """
 You are an AI system that analyzes commit diffs and generates detailed task descriptions for developers.
