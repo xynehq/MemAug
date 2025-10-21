@@ -20,11 +20,19 @@ def branch_exists(repo_path, branch_name):
     )
     return result.returncode == 0
 
-def get_commit_hashes(repo_path, limit=None):
-    command = ['git', 'rev-list', '--reverse']
-    if limit:
-        command.append(f'--max-count={limit}')
+def get_commit_hashes(repo_path, limit=None, order='first'):
+    """
+    Get commit hashes from repository, always in chronological order.
 
+    Args:
+        repo_path: Path to git repository
+        limit: Maximum number of commits to return
+        order: 'first' to select from oldest commits, 'last' to select from newest commits
+
+    Returns:
+        List of commit hashes in chronological order (oldest to newest)
+    """
+    # Determine target branch
     target_branch = None
     if branch_exists(repo_path, 'main'):
         target_branch = 'main'
@@ -44,15 +52,40 @@ def get_commit_hashes(repo_path, limit=None):
         except subprocess.CalledProcessError:
             raise Exception(f"Neither 'main', 'master' nor any other branch found in {repo_path}")
 
-    branch_command = command + [target_branch]
-    result = subprocess.run(
-        branch_command,
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        check=True
-    )
-    return result.stdout.strip().split('\n')
+    if order == 'first':
+        # Get first N commits (oldest)
+        # Strategy: Get ALL commits in reverse chronological order (oldest first), then take first N
+        command = ['git', 'rev-list', '--reverse', target_branch]
+        result = subprocess.run(
+            command,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        all_commits = result.stdout.strip().split('\n')
+        # Take first N commits if limit specified, otherwise all
+        commits = all_commits[:limit] if limit else all_commits
+    else:  # order == 'last'
+        # Get last N commits (newest)
+        # Strategy: Get newest N commits (they come newest-first), then reverse to chronological
+        command = ['git', 'rev-list']
+        if limit:
+            command.append(f'--max-count={limit}')
+        command.append(target_branch)
+
+        result = subprocess.run(
+            command,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        commits = result.stdout.strip().split('\n')
+        # Reverse to get chronological order (oldest to newest)
+        commits = list(reversed(commits))
+
+    return commits
 
 def get_commit_diff(repo_path, commit_hash):
     result = subprocess.run(
@@ -108,9 +141,10 @@ def get_current_branch(repo_path):
     return result.stdout.strip()
 
 def process_repository(repo_name):
-    # Load config to get max_commits setting
+    # Load config to get processing settings
     config = load_config()
     max_commits = config.get('processing', {}).get('max_commits', None)
+    commit_order = config.get('processing', {}).get('commit_order', 'first')
 
     source_repo_path = os.path.join('data/repos', repo_name)
     # Create the main dataset directory
@@ -155,10 +189,11 @@ def process_repository(repo_name):
         except Exception as e:
             print(f"Error stashing changes in {repo_name}: {e}")
 
-        commit_hashes = get_commit_hashes(temp_repo_path, limit=max_commits)
+        commit_hashes = get_commit_hashes(temp_repo_path, limit=max_commits, order=commit_order)
         total_commits = len(commit_hashes)
 
-        commit_count_msg = f"all {total_commits} commits" if max_commits is None else f"{total_commits} commits"
+        order_msg = "oldest" if commit_order == 'first' else "newest"
+        commit_count_msg = f"all {total_commits} commits" if max_commits is None else f"{total_commits} {order_msg} commits"
         print(f"Processing {repo_name}: {commit_count_msg}")
 
         for i, commit_hash in enumerate(commit_hashes, 1):
