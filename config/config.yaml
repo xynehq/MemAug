@@ -8,7 +8,14 @@ paths:
 repositories:
   - name: bat
     url: "https://github.com/sharkdp/bat.git"
-
+  - name: ripgrep
+    url: "https://github.com/BurntSushi/ripgrep.git"
+  - name: starship
+    url: "https://github.com/starship/starship.git"
+  - name: tokio
+    url: "https://github.com/tokio-rs/tokio.git"
+  - name: deno
+    url: "https://github.com/denoland/deno.git"
 # Processing settings
 processing:
   max_commits: 10  # Set to null for all commits, or a number to limit
