@@ -9,6 +9,9 @@ dependencies = [
     "tree-sitter>=0.20.0,<0.21.0",
     "tree-sitter-languages>=1.10.2",
     "pyyaml>=6.0",
+    "requests>=2.32.4",
+    "openai>=2.2.0",
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +30,14 @@ generate-ast-diffs = "mem_aug.components.datagen.generate_ast_diffs:cli"
 generate-tasks = "mem_aug.components.datagen.generate_tasks:cli"
 generate-reasoning = "mem_aug.components.datagen.generate_reasoning:cli"
 generate-fim = "mem_aug.components.datagen.build_fim_dataset:cli"
+generate-labels = "mem_aug.components.datagen.generate_retrieval_labels:cli"
+generate-edit-seq = "mem_aug.components.datagen.build_edit_sequence_dataset:cli"
+generate-enhanced-tasks = "mem_aug.components.datagen.generate_enhanced_tasks:cli"
+run-pipeline = "mem_aug.components.datagen.run_pipeline:main"
+
+
+build-template = "mem_aug.utils.build_training_template:main"
+build-all-templates = "mem_aug.components.datagen.build_all_templates:main"
 build-commit-diff = "mem_aug.utils.build_commit_diff:cli"
 check-ast-coverage = "mem_aug.utils.check_ast_coverage:cli"
 test-llm = "mem_aug.utils.test_llm:cli"

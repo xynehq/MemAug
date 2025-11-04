@@ -211,3 +211,6 @@ __marimo__/
 data/
 env/
 logs/
+.claude/
+outputs/
+wandb/
