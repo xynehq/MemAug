@@ -19,7 +19,7 @@ repositories:
 
 # Processing settings
 processing:
-  max_commits: 100  # Set to null for all commits, or a number to limit
+  max_commits: null  # Set to null for all commits, or a number to limit
   commit_order: "last"  # "first" for oldest commits, "last" for newest commits
   pr_mode: true  # Process PRs as sequences (true) or individual commits (false)
   file_types: [".rs"]
@@ -29,5 +29,6 @@ enhanced_tasks:
   max_ast_elements_per_batch: 20  # Maximum AST elements to send to LLM at once
   max_related_group_size: 4      # Maximum functions in a related group
   enable_operation_type_reasoning: true  # Include MODIFY/DELETE/ADD reasoning
-  max_concurrent_llm_calls: 50   # Maximum concurrent LLM API calls (semaphore size)
+  max_concurrent_llm_calls: 20   # Maximum concurrent LLM API calls (semaphore size)
   max_concurrent_commits: 4      # Maximum commits to process in parallel
+  max_ast_elements_per_commit: 500  # Skip commits with more than this many AST elements
