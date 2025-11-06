@@ -28,11 +28,14 @@ manage-repos = "mem_aug.utils.repo_manager:cli"
 generate-ast = "mem_aug.components.datagen.generate_commit_ast:cli"
 generate-ast-diffs = "mem_aug.components.datagen.generate_ast_diffs:cli"
 generate-tasks = "mem_aug.components.datagen.generate_tasks:cli"
-generate-reasoning = "mem_aug.components.datagen.generate_reasoning:cli"
-generate-fim = "mem_aug.components.datagen.build_fim_dataset:cli"
-generate-labels = "mem_aug.components.datagen.generate_retrieval_labels:cli"
-generate-edit-seq = "mem_aug.components.datagen.build_edit_sequence_dataset:cli"
-generate-enhanced-tasks = "mem_aug.components.datagen.generate_enhanced_tasks:cli"
+generate-reasoning = "mem_aug.components.datagen.generate_reasoning:cli" # Generate reasoning for tasks
+generate-fim = "mem_aug.components.datagen.build_fim_dataset:cli" # Generate FIM-complete dataset from diff
+generate-labels = "mem_aug.components.datagen.generate_retrieval_labels:cli" # Generate retrieval labels
+generate-edit-seq = "mem_aug.components.datagen.build_edit_sequence_dataset:cli" # Generate edit sequence dataset
+generate-enhanced-tasks = "mem_aug.components.datagen.generate_enhanced_tasks:cli" # Tasks with reasoning and retrieval info
+generate-code-task = "mem_aug.components.datagen.generate_code_task:cli" # Generated code tasks eg: code completion, fim, full function generation
+generate-diff-str = "mem_aug.components.datagen.generate_diff_string:cli" # Generate diff strings from AST diffs
+build-dataset = "mem_aug.components.datagen.build_training_dataset:cli" # Build final training dataset
 run-pipeline = "mem_aug.components.datagen.run_pipeline:main"
 
 
