@@ -2,6 +2,7 @@
 Generates AST diffs between consecutive commits for all repositories.
 This is Step 2 of the pipeline after generate_commit_ast.py.
 """
+
 import os
 import json
 import re
@@ -19,7 +20,7 @@ def find_repo_dirs(base_dir: str) -> List[str]:
 
 def find_commit_dirs(repo_dir: str) -> List[str]:
     """Finds and sorts commit directories within a repository directory."""
-    commit_pattern = re.compile(r'^commit_(\d+)$')
+    commit_pattern = re.compile(r"^commit_(\d+)$")
     commit_dirs = []
     for d in os.listdir(repo_dir):
         if os.path.isdir(os.path.join(repo_dir, d)) and commit_pattern.match(d):
@@ -30,7 +31,7 @@ def find_commit_dirs(repo_dir: str) -> List[str]:
     return commit_dirs
 
 
-def process_repository_diffs(repo_name: str, base_dir: str = 'data/ast_dataset'):
+def process_repository_diffs(repo_name: str, base_dir: str = "data/ast_dataset"):
     """
     Processes a single repository to generate AST diffs between consecutive commits.
 
@@ -46,7 +47,9 @@ def process_repository_diffs(repo_name: str, base_dir: str = 'data/ast_dataset')
     commit_dirs = find_commit_dirs(repo_path)
 
     if len(commit_dirs) < 2:
-        print(f"Skipping {repo_name}: Not enough commits to compare (found {len(commit_dirs)}).")
+        print(
+            f"Skipping {repo_name}: Not enough commits to compare (found {len(commit_dirs)})."
+        )
         return
 
     diffs_generated = 0
@@ -55,22 +58,34 @@ def process_repository_diffs(repo_name: str, base_dir: str = 'data/ast_dataset')
     # Compare consecutive commits
     for i in range(len(commit_dirs) - 1):
         commit1_name = commit_dirs[i]
-        commit2_name = commit_dirs[i+1]
+        commit2_name = commit_dirs[i + 1]
 
         commit1_dir = os.path.join(repo_path, commit1_name)
         commit2_dir = os.path.join(repo_path, commit2_name)
 
-        file1 = os.path.join(commit1_dir, 'ast.jsonl')
-        file2 = os.path.join(commit2_dir, 'ast.jsonl')
-        output_file = os.path.join(commit2_dir, 'diff_ast.jsonl')
-        commit_data_file = os.path.join(commit2_dir, 'commit_data.json')
+        file1 = os.path.join(commit1_dir, "ast.jsonl")
+        file2 = os.path.join(commit2_dir, "ast.jsonl")
+        output_file = os.path.join(commit2_dir, "diff_ast.jsonl")
+        commit_data_file = os.path.join(commit2_dir, "commit_data.json")
+
+        # Skip if output file already exists
+        if os.path.exists(output_file):
+            print(
+                f"  ⊘ Skipping {commit1_name} → {commit2_name}: diff_ast.jsonl already exists"
+            )
+            diffs_skipped += 1
+            continue
 
         if not os.path.exists(file1):
-            print(f"  ✗ Skipping {commit1_name} → {commit2_name}: AST file not found for {commit1_name}")
+            print(
+                f"  ✗ Skipping {commit1_name} → {commit2_name}: AST file not found for {commit1_name}"
+            )
             diffs_skipped += 1
             continue
         if not os.path.exists(file2):
-            print(f"  ✗ Skipping {commit1_name} → {commit2_name}: AST file not found for {commit2_name}")
+            print(
+                f"  ✗ Skipping {commit1_name} → {commit2_name}: AST file not found for {commit2_name}"
+            )
             diffs_skipped += 1
             continue
 
@@ -78,10 +93,10 @@ def process_repository_diffs(repo_name: str, base_dir: str = 'data/ast_dataset')
         use_commit_data = False
         if os.path.exists(commit_data_file):
             try:
-                with open(commit_data_file, 'r') as f:
+                with open(commit_data_file, "r") as f:
                     commit_data = json.load(f)
                     # Check if the diff contains changes to .rs files
-                    if '.rs' in commit_data.get('diff', ''):
+                    if ".rs" in commit_data.get("diff", ""):
                         use_commit_data = True
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 pass  # Silently skip if can't read commit data
@@ -92,7 +107,7 @@ def process_repository_diffs(repo_name: str, base_dir: str = 'data/ast_dataset')
                 file1,
                 file2,
                 output_file,
-                commit_data_file=commit_data_file if use_commit_data else None
+                commit_data_file=commit_data_file if use_commit_data else None,
             )
             print(f"  ✓ Generated diff: {commit1_name} → {commit2_name}")
             diffs_generated += 1
@@ -100,10 +115,12 @@ def process_repository_diffs(repo_name: str, base_dir: str = 'data/ast_dataset')
             print(f"  ✗ Error generating diff {commit1_name} → {commit2_name}: {e}")
             diffs_skipped += 1
 
-    print(f"\nCompleted {repo_name}: {diffs_generated} diffs generated, {diffs_skipped} skipped")
+    print(
+        f"\nCompleted {repo_name}: {diffs_generated} diffs generated, {diffs_skipped} skipped"
+    )
 
 
-def run_diff_pipeline(repos: List[str] = None, base_dir: str = 'data/ast_dataset'):
+def run_diff_pipeline(repos: List[str] = None, base_dir: str = "data/ast_dataset"):
     """
     Runs the diff generation pipeline for specified repositories or all repositories.
 
